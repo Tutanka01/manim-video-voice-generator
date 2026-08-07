@@ -30,12 +30,15 @@ def client(tmp_path: Path):
 
 
 def _wait_for_ready(test_client: TestClient, deadline_seconds: float = 10.0) -> None:
+    # With lazy loading the health check answers 200 as soon as the engine is
+    # operational (idle or ready). Wait instead for the synthesis-profile probe
+    # so healthz assertions and cache keys are deterministic.
     deadline = time.monotonic() + deadline_seconds
     while time.monotonic() < deadline:
-        if test_client.get("/healthz").status_code == 200:
+        if test_client.app.state.engine.synthesis_profile() is not None:
             return
         time.sleep(0.05)
-    raise AssertionError("engine never became ready")
+    raise AssertionError("engine probe never completed")
 
 
 def _wait_for_job(test_client: TestClient, job_id: str, deadline_seconds: float = 30.0) -> dict:
@@ -68,10 +71,43 @@ def test_healthz_reports_engine_without_auth(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["engine"] == "fake"
-    assert body["state"] == "ready"
+    assert body["state"] == "idle"
+    assert body["model_loaded"] is False
+    assert body["idle_timeout_seconds"] == 900
     assert body["auth"] is True
     assert body["model_revision"] == "cdd3b911b1585e3f2dbc7775ef10f9926f58850a"
     assert len(body["engine_profile_id"]) == 64
+
+
+def test_model_loads_on_demand_and_unloads_after_idle(client: TestClient) -> None:
+    assert client.get("/healthz").json()["state"] == "idle"
+
+    response = client.post("/v1/tts/batch", json=_batch_payload(), headers=AUTH)
+    state = _wait_for_job(client, response.json()["job_id"])
+    assert state["status"] == "completed"
+
+    engine = client.app.state.engine
+    assert engine.state == "ready"
+    assert engine.model_loaded is True
+
+    # A fresh unload() call is a no-op while the grace period is open.
+    engine.unload()
+    assert engine.state == "ready"
+
+    # Pretend the grace period elapsed, then unload.
+    engine._last_activity = time.monotonic() - engine._idle_seconds - 5
+    engine.unload()
+    health = client.get("/healthz").json()
+    assert health["state"] == "idle"
+    assert health["model_loaded"] is False
+    assert health["engine_profile_id"]  # profile survives the unload
+    assert client.get("/healthz").status_code == 200
+
+    # The next cache miss lazily reloads and synthesizes again.
+    engine.ensure_ready()
+    assert engine.state == "ready"
+    second = client.post("/v1/tts/batch", json=_batch_payload(), headers=AUTH)
+    _wait_for_job(client, second.json()["job_id"])
 
 
 def test_endpoints_require_api_key(client: TestClient) -> None:

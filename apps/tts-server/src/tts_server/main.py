@@ -1,7 +1,9 @@
 """FastAPI app: batch TTS jobs, sync synthesis, downloads, health.
 
-One container = one model kept warm. The API is consumed by the video-api
-worker (``generate_voice_en.py --engine moss-remote``) over a trusted LAN/VPN,
+One container = one lazily-loaded model: the weights are freed from VRAM after
+an idle grace period (``TTS_SERVER_MODEL_IDLE_SECONDS``) and loaded again on
+the next cache miss. The API is consumed by the video-api worker
+(``generate_voice_en.py --engine moss-remote``) over a trusted LAN/VPN,
 authenticated with ``Authorization: Bearer <key>`` (or ``X-API-Key``).
 """
 from __future__ import annotations
@@ -25,6 +27,11 @@ from tts_server.schemas import BatchRequest, JobCreated, SyncRequest
 
 logger = logging.getLogger(__name__)
 
+# Budget granted to a synchronous synthesis for a cold model: with lazy
+# loading the first request after an idle period has to download and load the
+# ~16 GB checkpoint (the boot healthcheck historically granted 30 minutes).
+_SYNC_LOAD_BUDGET_SECONDS = 1800.0
+
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
@@ -40,7 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "TTS_SERVER_API_KEYS is empty: authentication is DISABLED. "
                 "Only acceptable on a trusted LAN/VPN."
             )
-        engine.start_loading()
+        engine.start()
         jobs.start()
         yield
         jobs.stop()
@@ -111,7 +118,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "auth": bool(settings.api_keys),
             }
         )
-        status_code = 200 if engine.state == "ready" else 503
+        status_code = 200 if engine.state != "error" else 503
         if engine.state == "error":
             info["error"] = engine.load_error
         return JSONResponse(status_code=status_code, content=info)
@@ -193,7 +200,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 reference_path = Path(tmp_dir) / "reference.wav"
                 reference_path.write_bytes(reference)
             try:
-                engine.ensure_ready(timeout=5)
+                # The model is lazy-loaded on the first request after an idle
+                # period, so give a cold load (download + weights) a generous
+                # budget before failing this test-only synchronous endpoint.
+                engine.ensure_ready(timeout=_SYNC_LOAD_BUDGET_SECONDS)
             except EngineNotReady as error:
                 raise HTTPException(status_code=503, detail=str(error)) from error
             engine_profile = engine.synthesis_profile()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import types
 
 import pytest
@@ -14,6 +16,7 @@ from tts_server.config import (
 )
 from tts_server.engine import (
     MOSS_GENERATION_PARAMETERS,
+    EngineNotReady,
     FakeEngine,
     MossEngine,
     estimate_new_tokens,
@@ -247,3 +250,118 @@ def test_moss_load_pins_weights_remote_code_and_codec(monkeypatch, tmp_path) -> 
         "sample_rate": 24000,
         "channels": 1,
     }
+
+
+# -- lazy lifecycle ----------------------------------------------------------
+
+
+def test_lazy_engine_starts_idle_and_loads_on_demand(tmp_path) -> None:
+    settings = Settings(
+        fake_engine=True,
+        data_dir=tmp_path,
+        image_digest=f"sha256:{'5' * 64}",
+    )
+    engine = FakeEngine(settings)
+    engine._probe_safely()
+
+    assert engine.state == "idle"
+    assert engine.model_loaded is False
+    assert engine.synthesis_profile() is not None
+    assert engine.info()["idle_timeout_seconds"] == 900
+
+    engine.ensure_ready()
+    assert engine.state == "ready"
+    assert engine.model_loaded is True
+
+
+def test_lazy_engine_never_loads_when_idle_timeout_is_zero(tmp_path) -> None:
+    settings = Settings(
+        fake_engine=True,
+        data_dir=tmp_path,
+        model_idle_seconds=0,
+        image_digest=f"sha256:{'6' * 64}",
+    )
+    engine = FakeEngine(settings)
+    engine.start()
+    time.sleep(0.05)
+    engine.ensure_ready()
+    assert engine.state == "ready"
+    # A zero timeout keeps the model warm; unload is still possible manually.
+    engine._last_activity = time.monotonic() - 10
+    engine.unload()
+    assert engine.state == "idle"
+
+
+def test_unload_is_respected_only_after_grace_and_keeps_profile(tmp_path) -> None:
+    settings = Settings(
+        fake_engine=True,
+        data_dir=tmp_path,
+        image_digest=f"sha256:{'7' * 64}",
+    )
+    engine = FakeEngine(settings)
+    engine._probe_safely()
+    engine.ensure_ready()
+
+    engine.unload()
+    assert engine.state == "ready"  # grace period still open
+
+    engine._last_activity = time.monotonic() - engine._idle_seconds - 5
+    engine.unload()
+    assert engine.state == "idle"
+    assert engine.model_loaded is False
+    assert engine.synthesis_profile() is not None
+
+    engine.ensure_ready()
+    assert engine.state == "ready"
+
+
+def test_watchdog_unloads_after_idle_timeout(tmp_path) -> None:
+    settings = Settings(
+        fake_engine=True,
+        data_dir=tmp_path / "d",
+        model_idle_seconds=0.2,
+        image_digest=f"sha256:{'8' * 64}",
+    )
+    engine = FakeEngine(settings)
+    engine._probe_safely()
+    engine.ensure_ready()
+    assert engine.state == "ready"
+
+    watchdog = threading.Thread(target=engine._watchdog_loop, daemon=True)
+    watchdog.start()
+    time.sleep(1.3)
+    try:
+        assert engine.state == "idle"
+    finally:
+        engine._stop.set()
+        watchdog.join(timeout=2)
+
+
+def test_failed_load_retries_on_demand(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        fake_engine=True,
+        data_dir=tmp_path,
+        image_digest=f"sha256:{'9' * 64}",
+    )
+    engine = FakeEngine(settings)
+    attempts = {"n": 0}
+    original_load = engine._load
+
+    def flaky_load() -> None:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("transient failure")
+        return original_load()
+
+    monkeypatch.setattr(engine, "_load", flaky_load)
+    engine._probe_safely()
+
+    with pytest.raises(EngineNotReady, match="failed to load"):
+        engine.ensure_ready(timeout=2)
+    assert engine.state == "error"
+
+    # Skip the retry cooldown, then the next request recovers.
+    engine._last_load_attempt = 0
+    engine.ensure_ready(timeout=2)
+    assert engine.state == "ready"
+    assert attempts["n"] == 2

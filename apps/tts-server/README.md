@@ -2,20 +2,30 @@
 
 Microservice GPU optionnel pour PromptLoom. Il expose
 [OpenMOSS-Team/MOSS-TTS-v1.5](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-v1.5)
-par HTTP dans un conteneur Docker, avec un modèle **chargé une seule fois et
-conservé en VRAM**. L'application `apps/video-api` l'utilise avec le moteur vocal
+par HTTP dans un conteneur Docker. Le checkpoint (~8B, 16-18 Go de VRAM) n'est
+**pas chargé en permanence** : il est chargé à la première synthèse (cache miss),
+puis déchargé de la VRAM après une grâce d'inactivité
+(`TTS_SERVER_MODEL_IDLE_SECONDS`, défaut 15 min) et chargé à nouveau à la
+demande. L'application `apps/video-api` l'utilise avec le moteur vocal
 `moss-remote`.
 
-Le worker vidéo chargeait auparavant le checkpoint MOSS d'environ 8 milliards
-de paramètres dans chaque processus et pour chaque job. Déporter la synthèse
-sur un GPU dédié évite les rechargements et ajoute un cache audio partagé :
-une réparation ne resynthétise que les segments modifiés.
+Ce comportement évite de consommer ~16-18 Go de VRAM 24/7 quand le serveur dort
+entre deux jobs. Le profil de synthèse (device/dtype/attention/fréquence) est
+résolu au démarrage sans charger les poids, donc le cache audio CAS fonctionne
+même modèle froid : un job entièrement en cache ne relance jamais le GPU.
+Mettre `TTS_SERVER_MODEL_IDLE_SECONDS=0` restaure l'ancien comportement
+« modèle gardé chaud en VRAM en permanence ».
+
+Le worker vidéo chargeait auparavant le checkpoint MOSS dans chaque processus et
+pour chaque job. Déporter la synthèse sur un GPU dédié évite des rechargements
+par job, et le cache audio partagé fait qu'une réparation ne resynthétise que
+les segments modifiés.
 
 ## API
 
 | Méthode | Chemin | Description |
 | --- | --- | --- |
-| `GET` | `/healthz` | État du moteur (`loading`/`ready`/`error`), révisions épinglées, profil de synthèse, GPU/VRAM et profondeur de file. `200` si prêt, sinon `503`. Sans authentification. |
+| `GET` | `/healthz` | État du moteur (`idle`/`loading`/`ready`/`error`), `model_loaded`, grâce d'inactivité, révisions épinglées, profil de synthèse, GPU/VRAM et profondeur de file. `200` dès que le serveur opérationnel (`idle`/`loading`/`ready`), `503` uniquement en erreur. Sans authentification. |
 | `POST` | `/v1/tts/batch` | Soumet tous les segments d'une vidéo. Répond `202` avec un `job_id`. |
 | `GET` | `/v1/jobs/{job_id}` | Progression par segment et URLs de téléchargement. |
 | `GET` | `/v1/jobs/{job_id}/audio/{key}.wav` | Télécharge le WAV PCM16 canonique d'un segment. |
@@ -121,14 +131,19 @@ docker compose up --build -d
 docker compose logs -f tts  # suivre le téléchargement et le chargement
 ```
 
-Le premier démarrage télécharge le checkpoint dans le volume `tts_data`
-(`/data/hf-cache`). Le healthcheck accorde 30 minutes à ce chargement.
+Le premier démarrage résout le profil de synthèse (codec, processeur,
+device/dtype/attention) dans le volume `tts_data` (`/data/hf-cache`) ; le
+checkpoint lui-même est téléchargé et chargé à la **première synthèse**. Le
+serveur est opérationnel dès le profile résolu, avec le modèle `idle` ; le
+healthcheck ne limite plus le démarrage au téléchargement du checkpoint.
 
 ```bash
-curl http://localhost:8100/healthz
+curl http://localhost:8100/healthz   # state: idle | loading | ready | error
 ```
 
-Smoke test d'une synthèse réelle :
+Smoke test d'une synthèse réelle : la première requête après le boot (ou après
+une période d'inactivité) attend le chargement du checkpoint, généralement
+quelques minutes selon le réseau.
 
 ```bash
 curl -s -X POST http://localhost:8100/v1/tts \
@@ -158,7 +173,7 @@ Voir `.env.example`. Variables principales :
 | Variable | Défaut | Rôle |
 | --- | --- | --- |
 | `TTS_SERVER_API_KEYS` | vide | Clés séparées par des virgules. Vide désactive l'authentification ; réseau de confiance uniquement. |
-| `TTS_SERVER_MODEL` | `OpenMOSS-Team/MOSS-TTS-v1.5` | Modèle chargé au démarrage. |
+| `TTS_SERVER_MODEL` | `OpenMOSS-Team/MOSS-TTS-v1.5` | Modèle servi ; chargé à la demande, déchargé après la grâce d'inactivité. |
 | `TTS_SERVER_MODEL_REVISION` | `cdd3b9…58850a` | Commit exact sur 40 caractères pour les poids et le code distant. Tags et branches refusés. |
 | `TTS_SERVER_CODEC_MODEL` | `OpenMOSS-Team/MOSS-Audio-Tokenizer` | Dépôt du codec chargé par le processeur MOSS. |
 | `TTS_SERVER_CODEC_REVISION` | `3cd226…ba782` | Commit exact du codec sur 40 caractères. Tags et branches refusés. |
@@ -168,6 +183,7 @@ Voir `.env.example`. Variables principales :
 | `TTS_SERVER_BATCH_SIZE` | `1` | Segments de même référence par passe. Augmenter prudemment et valider l'audio. |
 | `TTS_SERVER_JOB_TTL_HOURS` | `48` | Délai avant purge des jobs terminaux et de leurs WAV. |
 | `TTS_SERVER_CACHE_TTL_DAYS` | `30` | Rétention du cache WAV ; `0` le conserve indéfiniment. |
+| `TTS_SERVER_MODEL_IDLE_SECONDS` | `900` | Grâce d'inactivité : après ce délai sans synthèse, le checkpoint est déchargé de la VRAM et rechargé à la demande. `0` garde le modèle chaud en permanence (ancien comportement). |
 | `TTS_SERVER_FAKE_ENGINE` | `0` | `1` active le moteur de test, sans GPU ni Torch. |
 
 ## Tests
@@ -198,3 +214,10 @@ uv venv && uv pip install -e '.[test]' && uv run pytest -q
   identité aléatoire propre au démarrage empêche tout hit après redémarrage,
   même si les anciens fichiers restent sur disque.
 - `flash-attn` est optionnel. Sans lui, le moteur utilise PyTorch SDPA.
+- Le modèle vit en VRAM seulement quand il sert une synthèse. Après
+  `TTS_SERVER_MODEL_IDLE_SECONDS` sans génération, il est déchargé (GC +
+  `torch.cuda.empty_cache()`) ; le profil de synthèse et les clés CAS
+  survivent au déchargement, donc un réemploi ne re-synthétise que les vrais
+  misses. Un chargement à la demande (dont le premier après le boot) peut
+  prendre quelques minutes ; le worker vidéo (`VIDEO_API_TTS_SERVER_TIMEOUT`,
+  défaut 3600 s) tolère ce délai.

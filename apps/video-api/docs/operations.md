@@ -151,7 +151,7 @@ le deploiement ne permet pas :
 | `chatterbox` | `en` | Defaut historique, lent sur CPU, timbre unique. |
 | `kokoro` | `en`, `fr` | ~5x temps reel sur CPU; moteur force par `draft`. |
 | `moss` | Toutes celles acceptees par l'API | Local; prevoir un GPU. |
-| `moss-remote` | Toutes | Modele garde en VRAM sur `apps/tts-server`. |
+| `moss-remote` | Toutes | Modele charge a la demande sur `apps/tts-server`, decharge apres grace d'inactivite. |
 | `openai` | Selon le serveur configure | Appel reseau facture, aucune charge locale. |
 
 #### Selection de voix par requete
@@ -223,7 +223,8 @@ reference de voix.
 
 Pour deporter MOSS-TTS sur un serveur GPU dedie (voir `apps/tts-server/README.md`),
 le moteur `moss-remote` envoie les textes des segments au serveur et telecharge
-les WAV PCM16 ; le modele reste charge en VRAM la-bas entre les jobs. Les WAV
+les WAV PCM16 ; le modele y est charge a la demande et decharge apres la grace
+d'inactivite. Les WAV
 sont paddés et concaténés directement, puis le mastering/loudnorm précède
 l'unique encodage AAC final :
 

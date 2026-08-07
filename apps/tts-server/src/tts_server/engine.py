@@ -1,11 +1,15 @@
-"""MOSS-TTS engine: loaded once at startup, GPU access serialized by a lock.
+"""MOSS-TTS engine: the ~8B checkpoint is loaded lazily on first use and
+unloaded again after an idle grace period, so the GPU server does not keep
+16-18 GB of VRAM allocated around the clock. GPU access is serialized by a lock.
 
 The synthesis logic mirrors the reference implementation in
 ``videos/linux-fondamentaux/002-c-est-quoi-un-syscall/generate_voice_en.py``
 (device/dtype/attention selection, language names, reference-audio cloning) so
-the remote voice sounds exactly like the local ``moss`` engine. The win of this
-server is operational: the ~8B model stays warm in VRAM between jobs instead of
-being reloaded per video.
+the remote voice sounds exactly like the local ``moss`` engine. The synthesis
+profile (device/dtype/attention/sample-rate) is resolved without loading the
+weights, so the content-addressed audio cache keeps working while the model is
+cold; ``TTS_SERVER_MODEL_IDLE_SECONDS`` controls the idle grace before unload
+(0 keeps the model permanently warm).
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ import logging
 import platform
 import re
 import threading
+import time
 import uuid
 import wave
 from pathlib import Path
@@ -155,13 +160,61 @@ class BaseEngine:
         self._load_error: str | None = None
         self._synthesis_profile: dict | None = None
         self._image_digest = _image_identity(settings.image_digest)
+        # Lazy-load / idle-unload bookkeeping.
+        self._load_in_progress = threading.Event()
+        self._start_lock = threading.Lock()
+        self._load_thread: threading.Thread | None = None
+        self._last_load_attempt = 0.0
+        self._last_activity = time.monotonic()
+        self._stop = threading.Event()
+        self._idle_seconds = max(0.0, settings.model_idle_seconds)
 
     # -- lifecycle -----------------------------------------------------------
-    def start_loading(self) -> None:
-        thread = threading.Thread(target=self._load_safely, name="engine-load", daemon=True)
-        thread.start()
+    # After a failed load a caller may retry on demand, at most once per
+    # cooldown, so a transient error does not brick the server until restart.
+    _LOAD_RETRY_COOLDOWN = 60.0
+
+    def start(self) -> None:
+        """Boot the engine into a cold-but-usable state.
+
+        The synthesis profile (device/dtype/attention/sample-rate) is resolved
+        without loading the checkpoint, so the content-addressed audio cache
+        already works while VRAM stays free. Weights are loaded by the first
+        synthesis and unloaded again after ``model_idle_seconds`` without use.
+        """
+        threading.Thread(target=self._probe_safely, name="engine-probe", daemon=True).start()
+        if self._idle_seconds > 0:
+            watchdog = threading.Thread(
+                target=self._watchdog_loop, name="engine-idle", daemon=True
+            )
+            watchdog.start()
+        logger.info(
+            "engine.boot engine=%s model=%s lazy=on idle_timeout=%.0fs",
+            self.name,
+            self.settings.model_id,
+            self._idle_seconds,
+        )
+
+    def _probe_safely(self) -> None:
+        """Resolve the synthesis profile in the background; never loads weights."""
+        try:
+            self._initialize()
+            self._synthesis_profile = self._build_synthesis_profile()
+        except Exception as error:  # noqa: BLE001 - surfaced via state/ensure_ready
+            self._load_error = f"{type(error).__name__}: {error}"
+            logger.exception("engine.probe.failed model=%s", self.settings.model_id)
+        else:
+            logger.info(
+                "engine.idle engine=%s model=%s (profile ready, weights lazy)",
+                self.name,
+                self.settings.model_id,
+            )
+
+    def _initialize(self) -> None:  # pragma: no cover - overridden
+        pass
 
     def _load_safely(self) -> None:
+        self._load_in_progress.set()
         try:
             self._load()
             self._synthesis_profile = self._build_synthesis_profile()
@@ -171,6 +224,8 @@ class BaseEngine:
         else:
             self._ready.set()
             logger.info("engine.ready engine=%s model=%s", self.name, self.settings.model_id)
+        finally:
+            self._load_in_progress.clear()
 
     def _load(self) -> None:  # pragma: no cover - overridden
         pass
@@ -224,16 +279,47 @@ class BaseEngine:
     def state(self) -> str:
         if self._load_error:
             return "error"
-        return "ready" if self._ready.is_set() else "loading"
+        if self._ready.is_set():
+            return "ready"
+        if self._load_in_progress.is_set():
+            return "loading"
+        return "idle"
+
+    @property
+    def model_loaded(self) -> bool:
+        return self._ready.is_set()
 
     @property
     def load_error(self) -> str | None:
         return self._load_error
 
-    def ensure_ready(self, timeout: float | None = None) -> None:
-        """Block until the model is loaded; raise if loading failed/timed out."""
-        import time
+    def _ensure_load_thread(self) -> None:
+        """Start (or reuse) the single background load thread when not ready.
 
+        A failed load is retried on demand, at most once per cooldown, so a
+        transient error does not leave the server bricked until restart.
+        """
+        if self._ready.is_set():
+            return
+        with self._start_lock:
+            if self._ready.is_set():
+                return
+            if self._load_error:
+                if time.monotonic() - self._last_load_attempt < self._LOAD_RETRY_COOLDOWN:
+                    return
+                self._load_error = None
+            thread = self._load_thread
+            if thread is None or not thread.is_alive():
+                self._last_load_attempt = time.monotonic()
+                self._load_thread = threading.Thread(
+                    target=self._load_safely, name="engine-load", daemon=True
+                )
+                self._load_thread.start()
+
+    def ensure_ready(self, timeout: float | None = None) -> None:
+        """Block until the model is loaded; load it lazily from an idle state
+        and raise if loading failed/timed out."""
+        self._ensure_load_thread()
         deadline = None if timeout is None else time.monotonic() + timeout
         while not self._ready.wait(timeout=1.0):
             if self._load_error:
@@ -242,12 +328,58 @@ class BaseEngine:
                 raise EngineNotReady("timed out waiting for the model to load")
         if self._load_error:
             raise EngineNotReady(f"model failed to load: {self._load_error}")
+        self._note_activity()
+
+    def _note_activity(self) -> None:
+        """Re-arm the idle grace period, called under the engine lock at the
+        end of every synthesis so an in-flight run is never unloaded."""
+        self._last_activity = time.monotonic()
+
+    def unload(self) -> None:
+        """Release the model's GPU memory after an idle period.
+
+        A running synthesis holds the engine lock, so this never tears the
+        model down mid-generation, and the synthesis profile (hence the CAS
+        keys) survives the unload.
+        """
+        with self._lock:
+            if not self._ready.is_set():
+                return
+            if self._idle_seconds > 0 and (
+                time.monotonic() - self._last_activity < self._idle_seconds
+            ):
+                return
+            self._ready.clear()
+            self._unload()
+        logger.info("engine.unloaded engine=%s state=%s", self.name, self.state)
+
+    def _unload(self) -> None:  # pragma: no cover - overridden
+        pass
+
+    def _watchdog_loop(self) -> None:
+        tick = max(1.0, min(30.0, self._idle_seconds / 2.0))
+        while not self._stop.wait(timeout=tick):
+            try:
+                if not self._ready.is_set() or self._load_in_progress.is_set():
+                    continue
+                if time.monotonic() - self._last_activity >= self._idle_seconds:
+                    idle = time.monotonic() - self._last_activity
+                    logger.info(
+                        "engine.unload.idle engine=%s idle=%.0fs timeout=%.0fs",
+                        self.name,
+                        idle,
+                        self._idle_seconds,
+                    )
+                    self.unload()
+            except Exception:  # noqa: BLE001 - the watchdog must never die
+                logger.exception("engine.unload.error")
 
     # -- synthesis -----------------------------------------------------------
     def synthesize(self, text: str, language: str, reference: Path | None, out_path: Path) -> None:
         self.ensure_ready()
         with self._lock:
             self._synthesize(text, language, reference, out_path)
+            self._note_activity()
 
     def synthesize_batch(
         self,
@@ -268,6 +400,7 @@ class BaseEngine:
         self.ensure_ready()
         with self._lock:
             self._synthesize_batch(texts, language, reference, out_paths)
+            self._note_activity()
 
     def _synthesize(self, text: str, language: str, reference: Path | None, out_path: Path) -> None:
         raise NotImplementedError
@@ -291,6 +424,8 @@ class BaseEngine:
             "codec_revision": self._codec_revision,
             "image_digest": self._image_digest,
             "state": self.state,
+            "model_loaded": self.model_loaded,
+            "idle_timeout_seconds": self._idle_seconds,
         }
 
 
@@ -346,31 +481,83 @@ class MossEngine(BaseEngine):
         self._processor = None
         self._model = None
         self._device: str | None = None
+        self._dtype = None
         self._dtype_name: str | None = None
         self._attention: str | None = None
         self._sample_rate: int | None = None
+        self._init_lock = threading.Lock()
+
+    def _initialize(self) -> None:
+        """Resolve every immutable aspect of the engine without occupying VRAM.
+
+        Pins the model/codec revisions, downloads the codec and processor,
+        resolves device/dtype/attention and the sampling rate, and leaves the
+        synthesis profile available so the CAS cache already works while the
+        8B checkpoint stays cold. The audio tokenizer and model are only moved
+        to the device when :meth:`_load` actually needs to generate.
+        """
+        with self._init_lock:
+            if self._processor is not None and self._device is not None:
+                return
+            model_revision = _pinned_commit(
+                self.settings.model_revision,
+                "TTS_SERVER_MODEL_REVISION",
+            )
+            codec_revision = _pinned_commit(
+                self.settings.codec_revision,
+                "TTS_SERVER_CODEC_REVISION",
+            )
+            import torch
+            from huggingface_hub import snapshot_download
+            from transformers import AutoProcessor
+
+            device = _select_torch_device(self.settings.device)
+            if device == "cuda":
+                torch.backends.cuda.enable_cudnn_sdp(False)
+                torch.backends.cuda.enable_flash_sdp(True)
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+                torch.backends.cuda.enable_math_sdp(True)
+            dtype = _select_moss_dtype(self.settings.dtype, device)
+            attn_implementation = _resolve_attn_implementation(device, dtype)
+            logger.info(
+                "engine.probe model=%s device=%s dtype=%s attn=%s",
+                self.settings.model_id,
+                device,
+                dtype,
+                attn_implementation,
+            )
+            codec_path = snapshot_download(
+                repo_id=self.settings.codec_model_id,
+                revision=codec_revision,
+            )
+            processor = AutoProcessor.from_pretrained(
+                self.settings.model_id,
+                revision=model_revision,
+                code_revision=model_revision,
+                codec_path=codec_path,
+                trust_remote_code=True,
+            )
+            # NOTE: processor.audio_tokenizer is intentionally NOT moved to the
+            # device here; that only happens in _load so VRAM stays free while
+            # the model is cold.
+            self._processor = processor
+            self._device = device
+            self._dtype = dtype
+            self._dtype_name = str(dtype)
+            self._attention = attn_implementation
+            self._sample_rate = int(processor.model_config.sampling_rate)
 
     def _load(self) -> None:
-        model_revision = _pinned_commit(
-            self.settings.model_revision,
-            "TTS_SERVER_MODEL_REVISION",
-        )
-        codec_revision = _pinned_commit(
-            self.settings.codec_revision,
-            "TTS_SERVER_CODEC_REVISION",
-        )
+        if self._processor is None or self._device is None:
+            self._initialize()
+            self._synthesis_profile = self._build_synthesis_profile()
         import torch
-        from huggingface_hub import snapshot_download
-        from transformers import AutoModel, AutoProcessor
+        from transformers import AutoModel
 
-        device = _select_torch_device(self.settings.device)
-        if device == "cuda":
-            torch.backends.cuda.enable_cudnn_sdp(False)
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_math_sdp(True)
-        dtype = _select_moss_dtype(self.settings.dtype, device)
-        attn_implementation = _resolve_attn_implementation(device, dtype)
+        processor = self._processor
+        device = self._device
+        dtype = self._dtype
+        attn_implementation = self._attention
         logger.info(
             "engine.load.start model=%s device=%s dtype=%s attn=%s",
             self.settings.model_id,
@@ -378,34 +565,29 @@ class MossEngine(BaseEngine):
             dtype,
             attn_implementation,
         )
-        codec_path = snapshot_download(
-            repo_id=self.settings.codec_model_id,
-            revision=codec_revision,
-        )
-        processor = AutoProcessor.from_pretrained(
-            self.settings.model_id,
-            revision=model_revision,
-            code_revision=model_revision,
-            codec_path=codec_path,
-            trust_remote_code=True,
-        )
         processor.audio_tokenizer = processor.audio_tokenizer.to(device)
         model = AutoModel.from_pretrained(
             self.settings.model_id,
-            revision=model_revision,
-            code_revision=model_revision,
+            revision=self._model_revision,
+            code_revision=self._model_revision,
             trust_remote_code=True,
             attn_implementation=attn_implementation,
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
         ).to(device)
         model.eval()
-        self._processor = processor
         self._model = model
-        self._device = device
-        self._dtype_name = str(dtype)
-        self._attention = attn_implementation
-        self._sample_rate = int(processor.model_config.sampling_rate)
+
+    def _unload(self) -> None:
+        import gc
+
+        import torch
+
+        self._processor = None
+        self._model = None
+        gc.collect()
+        if self._device == "cuda":
+            torch.cuda.empty_cache()
 
     def _profile_details(self) -> dict:
         return {

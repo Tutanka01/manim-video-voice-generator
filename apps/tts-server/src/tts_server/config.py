@@ -84,6 +84,13 @@ class Settings:
     cache_ttl_days: float = field(
         default_factory=lambda: float(os.getenv("TTS_SERVER_CACHE_TTL_DAYS", "30"))
     )
+    # Lazy-load grace: the ~8B checkpoint is unloaded from VRAM after this many
+    # seconds without any synthesis, then loaded again on the next miss. The
+    # synthesis profile and CAS keys survive an unload. 0 keeps the model
+    # permanently warm (previous behavior).
+    model_idle_seconds: float = field(
+        default_factory=lambda: float(os.getenv("TTS_SERVER_MODEL_IDLE_SECONDS", "900"))
+    )
     # 1 = deterministic fake engine (silent WAVs, no torch import). Used by the
     # test suite and to exercise the API on a machine without GPU.
     fake_engine: bool = field(default_factory=lambda: _bool_env("TTS_SERVER_FAKE_ENGINE", False))

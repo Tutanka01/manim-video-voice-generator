@@ -80,8 +80,9 @@ def voice_command_for_settings(settings: Settings) -> tuple[list[str], dict[str,
             },
         )
     if engine in {"moss-remote", "moss_remote", "remote-moss"}:
-        # Remote GPU TTS server (apps/tts-server): the model stays warm in VRAM
-        # there, the worker only uploads texts and downloads WAVs.
+        # Remote GPU TTS server (apps/tts-server): the model is loaded there on
+        # demand and freed from VRAM after its idle grace period; the worker
+        # only uploads texts and downloads WAVs.
         if not settings.tts_server_url.strip():
             raise ValueError(
                 "VIDEO_API_TTS_SERVER_URL is required when VIDEO_API_VOICE_ENGINE=moss-remote"
