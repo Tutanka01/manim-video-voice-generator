@@ -530,10 +530,21 @@ class MossEngine(BaseEngine):
                 repo_id=self.settings.codec_model_id,
                 revision=codec_revision,
             )
-            processor = AutoProcessor.from_pretrained(
-                self.settings.model_id,
+            # Build a pinned, checkpoint-free snapshot of the model repo so the
+            # processor loads its remote code/config/tokenizer straight from
+            # disk. Recent transformers forwards `revision`/`code_revision`
+            # kwargs into the MOSS processor's own `from_pretrained`, which then
+            # passes them to ProcessorMixin.__init__ ("Unexpected keyword
+            # argument revision"). Passing a local snapshot path keeps everything
+            # pinned to the exact commit while the ~16 GB checkpoint shards stay
+            # lazy (downloaded/loaded on the first synthesis only).
+            model_snapshot = snapshot_download(
+                repo_id=self.settings.model_id,
                 revision=model_revision,
-                code_revision=model_revision,
+                ignore_patterns=["*.safetensors", "*.bin", "*.pt", "*.pth", "*.onnx"],
+            )
+            processor = AutoProcessor.from_pretrained(
+                model_snapshot,
                 codec_path=codec_path,
                 trust_remote_code=True,
             )
@@ -551,7 +562,6 @@ class MossEngine(BaseEngine):
         if self._processor is None or self._device is None:
             self._initialize()
             self._synthesis_profile = self._build_synthesis_profile()
-        import torch
         from transformers import AutoModel
 
         processor = self._processor

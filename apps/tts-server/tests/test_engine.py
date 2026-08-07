@@ -154,7 +154,7 @@ def test_mutable_or_invalid_codec_revisions_are_rejected(
 
 
 def test_moss_load_pins_weights_remote_code_and_codec(monkeypatch, tmp_path) -> None:
-    calls: dict[str, object] = {}
+    calls: dict[str, object] = {"snapshots": []}
 
     class _AudioTokenizer:
         def to(self, device):
@@ -189,8 +189,8 @@ def test_moss_load_pins_weights_remote_code_and_codec(monkeypatch, tmp_path) -> 
     huggingface_hub = types.ModuleType("huggingface_hub")
 
     def snapshot_download(**kwargs):
-        calls["codec"] = kwargs
-        return "/immutable/codec-snapshot"
+        calls["snapshots"].append(kwargs)
+        return f"/immutable/snapshot-{len(calls['snapshots'])}"
 
     huggingface_hub.snapshot_download = snapshot_download
     transformers = types.ModuleType("transformers")
@@ -220,16 +220,23 @@ def test_moss_load_pins_weights_remote_code_and_codec(monkeypatch, tmp_path) -> 
     engine = MossEngine(settings)
     engine._load()
 
-    assert calls["codec"] == {
+    # The codec snapshot is pinned and passed to the processor as codec_path.
+    assert calls["snapshots"][0] == {
         "repo_id": settings.codec_model_id,
         "revision": DEFAULT_CODEC_REVISION,
     }
-    processor_model, processor_kwargs = calls["processor"]
-    assert processor_model == settings.model_id
-    assert processor_kwargs == {
+    # A pinned checkpoint-free snapshot of the model repo feeds the processor:
+    # no `revision`/`code_revision` kwargs may reach the custom MOSS processor
+    # (recent transformers forwards them into ProcessorMixin.__init__).
+    assert calls["snapshots"][1] == {
+        "repo_id": settings.model_id,
         "revision": DEFAULT_MODEL_REVISION,
-        "code_revision": DEFAULT_MODEL_REVISION,
-        "codec_path": "/immutable/codec-snapshot",
+        "ignore_patterns": ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.onnx"],
+    }
+    processor_model, processor_kwargs = calls["processor"]
+    assert processor_model == "/immutable/snapshot-2"
+    assert processor_kwargs == {
+        "codec_path": "/immutable/snapshot-1",
         "trust_remote_code": True,
     }
     model_id, model_kwargs = calls["model"]
